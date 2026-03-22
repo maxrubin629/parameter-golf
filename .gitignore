@@ -11,3 +11,4 @@ data/docs_selected.jsonl
 logs/
 agent-context/
 train_gpt_mlx_baseline.py
+sweep_train_gpt_mlx_v2.py
