@@ -12,3 +12,6 @@ logs/
 agent-context/
 train_gpt_mlx_baseline.py
 sweep_train_gpt_mlx_v2.py
+train_gpt_mlx_current_best.py
+/.agents
+skills-lock.json
