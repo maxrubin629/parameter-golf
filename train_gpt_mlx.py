@@ -52,6 +52,7 @@ class Hyperparameters:
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
     # Validation always uses the full fineweb_val split.
     val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    val_max_tokens: int = int(os.environ.get("VAL_MAX_TOKENS", 0))
     train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
@@ -74,6 +75,12 @@ class Hyperparameters:
     num_heads: int = int(os.environ.get("NUM_HEADS", 20))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 10))
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
+    mlp_kind: str = os.environ.get("MLP_KIND", "dense").strip().lower()
+    moe_num_experts: int = int(os.environ.get("MOE_NUM_EXPERTS", 4))
+    moe_top_k: int = int(os.environ.get("MOE_TOP_K", 1))
+    moe_expert_mlp_mult: float = float(os.environ.get("MOE_EXPERT_MLP_MULT", os.environ.get("MLP_MULT", 2)))
+    moe_aux_loss_weight: float = float(os.environ.get("MOE_AUX_LOSS_WEIGHT", 1e-2))
+    moe_capacity_factor: float = float(os.environ.get("MOE_CAPACITY_FACTOR", 1.25))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
@@ -171,6 +178,12 @@ def accumulate_flat_grads(
 
 def rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
     return (x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)).astype(x.dtype)
+
+
+def swiglu(projected: mx.array) -> mx.array:
+    gate = mx.minimum(projected[..., ::2], 7.0)
+    up = mx.minimum(mx.maximum(projected[..., 1::2], -7.0), 7.0)
+    return gate * (1.0 / (1.0 + mx.exp(-1.702 * gate))) * (up + 1.0)
 
 
 def zeropower_newtonschulz5(g: mx.array, steps: int, eps: float = 1e-7) -> mx.array:
@@ -343,15 +356,134 @@ class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = dim * mlp_mult
+        self.hidden = hidden
         self.fc = CastedLinear(dim, hidden * 2)
         self.proj = CastedLinear(hidden, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        projected = self.fc(x)
-        gate = mx.minimum(projected[..., ::2], 7.0)
-        up = mx.minimum(mx.maximum(projected[..., 1::2], -7.0), 7.0)
-        act = gate * (1.0 / (1.0 + mx.exp(-1.702 * gate))) * (up + 1.0)
-        return self.proj(act)
+        return self.proj(swiglu(self.fc(x)))
+
+    def forward_with_aux(self, x: mx.array) -> tuple[mx.array, mx.array]:
+        return self(x), mx.array(0.0, dtype=mx.float32)
+
+    def zero_init_proj(self) -> None:
+        self.proj.weight = mx.zeros_like(self.proj.weight)
+
+
+class MoEMLP(nn.Module):
+    # Sparse router over SwiGLU experts. `top_k=1` uses a true sparse dispatch
+    # path with fixed expert capacity; `top_k>1` falls back to the simpler
+    # materialized-all-experts path.
+    def __init__(
+        self,
+        dim: int,
+        expert_mlp_mult: float,
+        num_experts: int,
+        top_k: int,
+        aux_loss_weight: float,
+        capacity_factor: float,
+    ):
+        super().__init__()
+        if num_experts < 2:
+            raise ValueError("MOE_NUM_EXPERTS must be >= 2 when MLP_KIND=moe")
+        hidden = max(1, int(round(dim * expert_mlp_mult)))
+        self.dim = dim
+        self.hidden = hidden
+        self.num_experts = num_experts
+        self.top_k = max(1, min(top_k, num_experts))
+        self.aux_loss_weight = aux_loss_weight
+        self.capacity_factor = max(capacity_factor, 1.0)
+
+        self.router = CastedLinear(dim, num_experts)
+        self.fc_weight = (
+            mx.random.normal((num_experts * hidden * 2, dim), dtype=mx.float32) * (dim ** -0.5)
+        )
+        self.proj_weight = mx.zeros((num_experts * dim, hidden), dtype=mx.float32)
+
+    def _fc_weight(self, dtype: mx.Dtype) -> mx.array:
+        return self.fc_weight.reshape(self.num_experts, self.hidden * 2, self.dim).astype(dtype)
+
+    def _proj_weight(self, dtype: mx.Dtype) -> mx.array:
+        return self.proj_weight.reshape(self.num_experts, self.dim, self.hidden).astype(dtype)
+
+    def _forward_top1_sparse(self, x: mx.array, router_logits: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+        bsz, seqlen, _ = x.shape
+        n_tokens = bsz * seqlen
+        x_flat = x.reshape(n_tokens, self.dim)
+        router_probs = mx.softmax(router_logits, axis=-1).reshape(n_tokens, self.num_experts)
+
+        top1_idx = mx.stop_gradient(mx.argmax(router_logits.reshape(n_tokens, self.num_experts), axis=-1).astype(mx.int32))
+        top1_idx_col = top1_idx.reshape(n_tokens, 1)
+        top1_prob = mx.take_along_axis(router_probs, top1_idx_col, axis=-1).reshape(n_tokens).astype(x.dtype)
+        hard_assign = mx.put_along_axis(mx.zeros_like(router_probs), top1_idx_col, mx.ones((n_tokens, 1), dtype=router_probs.dtype), axis=-1)
+
+        counts = mx.sum(hard_assign, axis=0).astype(mx.int32)
+        sorted_token_idx = mx.stop_gradient(mx.argsort(top1_idx, axis=0).astype(mx.int32))
+        sorted_experts = mx.take(top1_idx, sorted_token_idx, axis=0)
+        sorted_x = mx.take(x_flat, sorted_token_idx, axis=0)
+        sorted_prob = mx.take(top1_prob, sorted_token_idx, axis=0)
+
+        expert_offsets = mx.cumsum(counts, axis=0) - counts
+        sorted_offsets = mx.take(expert_offsets, sorted_experts, axis=0)
+        positions = mx.arange(n_tokens, dtype=mx.int32) - sorted_offsets
+        capacity = max(1, int(math.ceil(self.capacity_factor * n_tokens / self.num_experts)))
+        keep = positions < capacity
+        safe_pos = mx.where(keep, positions + 1, mx.zeros_like(positions))
+        flat_slot = mx.stop_gradient((sorted_experts * (capacity + 1) + safe_pos).astype(mx.int32))
+
+        packed_inputs = mx.put_along_axis(
+            mx.zeros((self.num_experts * (capacity + 1), self.dim), dtype=x.dtype),
+            flat_slot.reshape(n_tokens, 1),
+            sorted_x * keep.astype(sorted_x.dtype)[:, None],
+            axis=0,
+        ).reshape(self.num_experts, capacity + 1, self.dim)
+
+        projected = mx.einsum("ecd,ehd->ech", packed_inputs, self._fc_weight(x.dtype))
+        packed_outputs = mx.einsum("ech,edh->ecd", swiglu(projected), self._proj_weight(x.dtype))
+        gathered = mx.take(packed_outputs.reshape(self.num_experts * (capacity + 1), self.dim), flat_slot, axis=0)
+        gathered = gathered * (sorted_prob * keep.astype(sorted_prob.dtype))[:, None]
+
+        y_flat = mx.put_along_axis(
+            mx.zeros((n_tokens, self.dim), dtype=gathered.dtype),
+            sorted_token_idx.reshape(n_tokens, 1),
+            gathered,
+            axis=0,
+        )
+        return (
+            y_flat.reshape(bsz, seqlen, self.dim),
+            router_probs.reshape(bsz, seqlen, self.num_experts),
+            hard_assign.reshape(bsz, seqlen, self.num_experts),
+        )
+
+    def _forward_materialized(self, x: mx.array, router_logits: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+        topk_idx = mx.stop_gradient(mx.argsort(router_logits, axis=-1)[..., -self.top_k :])
+        router_probs = mx.softmax(router_logits, axis=-1)
+        topk_probs = mx.take_along_axis(router_probs, topk_idx, axis=-1)
+        dispatch = mx.put_along_axis(mx.zeros_like(router_logits), topk_idx, topk_probs, axis=-1)
+        hard_assign = mx.put_along_axis(mx.zeros_like(router_logits), topk_idx, mx.ones_like(topk_probs), axis=-1)
+
+        projected = mx.einsum("btd,ehd->bteh", x, self._fc_weight(x.dtype))
+        expert_out = mx.einsum("bteh,edh->bted", swiglu(projected), self._proj_weight(x.dtype))
+        y = mx.sum(dispatch.astype(expert_out.dtype)[..., None] * expert_out, axis=2)
+        return y, router_probs, hard_assign
+
+    def forward_with_aux(self, x: mx.array) -> tuple[mx.array, mx.array]:
+        router_logits = self.router(x).astype(mx.float32)
+        if self.top_k == 1:
+            y, router_probs, hard_assign = self._forward_top1_sparse(x, router_logits)
+        else:
+            y, router_probs, hard_assign = self._forward_materialized(x, router_logits)
+
+        if self.aux_loss_weight <= 0.0:
+            return y, mx.array(0.0, dtype=mx.float32)
+
+        expert_prob = mx.mean(router_probs, axis=(0, 1))
+        expert_load = mx.mean(hard_assign, axis=(0, 1)) / float(self.top_k)
+        aux_loss = self.aux_loss_weight * (self.num_experts * mx.sum(expert_prob * expert_load))
+        return y, aux_loss.astype(mx.float32)
+
+    def zero_init_proj(self) -> None:
+        self.proj_weight = mx.zeros_like(self.proj_weight)
 
 
 class Block(nn.Module):
@@ -361,6 +493,12 @@ class Block(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
+        mlp_kind: str,
+        moe_num_experts: int,
+        moe_top_k: int,
+        moe_expert_mlp_mult: float,
+        moe_aux_loss_weight: float,
+        moe_capacity_factor: float,
         rope_base: float,
         qk_gain_init: float,
     ):
@@ -368,15 +506,29 @@ class Block(nn.Module):
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp_kind = mlp_kind
+        if mlp_kind == "dense":
+            self.mlp = MLP(dim, mlp_mult)
+        elif mlp_kind == "moe":
+            self.mlp = MoEMLP(
+                dim=dim,
+                expert_mlp_mult=moe_expert_mlp_mult,
+                num_experts=moe_num_experts,
+                top_k=moe_top_k,
+                aux_loss_weight=moe_aux_loss_weight,
+                capacity_factor=moe_capacity_factor,
+            )
+        else:
+            raise ValueError(f"Unsupported MLP_KIND={mlp_kind!r}; expected 'dense' or 'moe'")
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array) -> tuple[mx.array, mx.array]:
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        return x
+        mlp_out, aux_loss = self.mlp.forward_with_aux(self.mlp_norm(x))
+        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * mlp_out
+        return x, aux_loss
 
 
 class GPT(nn.Module):
@@ -384,23 +536,54 @@ class GPT(nn.Module):
     # - one shared transformer block applied recurrently for num_layers steps
     # - Full Attention Residuals over a depth cache, driven by learned pseudo-queries
     # - tied embeddings for the LM head
-    def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+    def __init__(
+        self,
+        vocab_size: int,
+        num_layers: int,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: int,
+        mlp_kind: str,
+        moe_num_experts: int,
+        moe_top_k: int,
+        moe_expert_mlp_mult: float,
+        moe_aux_loss_weight: float,
+        moe_capacity_factor: float,
+        logit_chunk_tokens: int,
+        logit_softcap: float,
+        rope_base: float,
+        tied_embed_init_std: float,
+        qk_gain_init: float,
+    ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.num_layers = num_layers
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+        self.mlp_kind = mlp_kind
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
-        self.block = Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+        self.block = Block(
+            dim,
+            num_heads,
+            num_kv_heads,
+            mlp_mult,
+            mlp_kind,
+            moe_num_experts,
+            moe_top_k,
+            moe_expert_mlp_mult,
+            moe_aux_loss_weight,
+            moe_capacity_factor,
+            rope_base,
+            qk_gain_init,
+        )
         self.pseudo_queries = mx.zeros((num_layers, dim), dtype=mx.float32)
         self.final_norm = RMSNormNoWeight()
 
         self.block.attn.proj.weight = mx.zeros_like(self.block.attn.proj.weight)
-        self.block.mlp.proj.weight = mx.zeros_like(self.block.mlp.proj.weight)
+        self.block.mlp.zero_init_proj()
         self.tok_emb.weight = (
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
         ).astype(COMPUTE_DTYPE)
@@ -419,25 +602,33 @@ class GPT(nn.Module):
         alphas = alphas / mx.sum(alphas, axis=0, keepdims=True)
         return mx.sum(alphas.astype(values.dtype)[..., None] * values, axis=0)
 
-    def __call__(self, input_ids: mx.array) -> mx.array:
+    def hidden_and_aux(self, input_ids: mx.array) -> tuple[mx.array, mx.array]:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
         depth_cache: list[mx.array] = [x]
+        aux_loss = mx.array(0.0, dtype=mx.float32)
 
         for step in range(self.num_layers):
             x = self.depth_attention(depth_cache, step)
-            x = self.block(x)
+            x, step_aux = self.block(x)
+            aux_loss = aux_loss + step_aux
             depth_cache.append(x)
-        return self.final_norm(depth_cache[-1])
+        return self.final_norm(depth_cache[-1]), aux_loss
 
-    def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
+    def __call__(self, input_ids: mx.array) -> mx.array:
+        x, _ = self.hidden_and_aux(input_ids)
+        return x
+
+    def loss(self, input_ids: mx.array, target_ids: mx.array, include_aux: bool = False) -> mx.array:
         # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
         # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
-        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
+        hidden, aux_loss = self.hidden_and_aux(input_ids)
+        x = hidden.reshape(-1, self.tok_emb.weight.shape[1])
         y = target_ids.reshape(-1)
         if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
             logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
             logits = self.softcap(logits_proj)
-            return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
+            ce = nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
+            return ce + aux_loss if include_aux else ce
 
         loss_sum = mx.array(0.0, dtype=mx.float32)
         n = int(x.shape[0])
@@ -446,7 +637,8 @@ class GPT(nn.Module):
             logits_proj = x[s:e] @ self.tok_emb.weight.astype(x.dtype).T
             logits = self.softcap(logits_proj)
             loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
-        return loss_sum / float(n)
+        ce = loss_sum / float(n)
+        return ce + aux_loss if include_aux else ce
 
 # ==============================================================================
 # OPTIMIZERS (MUON + ADAM SPLIT)
@@ -723,13 +915,15 @@ def validate_dataset_tokenizer_pair(data_path: str, tokenizer_path: str) -> tupl
     return dataset_dir.name, actual_train_files, expected_train_files
 
 
-def load_validation_tokens(pattern: str, seq_len: int) -> np.ndarray:
+def load_validation_tokens(pattern: str, seq_len: int, max_tokens: int = 0) -> np.ndarray:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
     # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
     tokens = np.ascontiguousarray(np.concatenate([load_data_shard(file) for file in files], axis=0))
     usable = ((tokens.size - 1) // seq_len) * seq_len
+    if max_tokens > 0:
+        usable = min(usable, (max_tokens // seq_len) * seq_len)
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
@@ -866,7 +1060,7 @@ def main() -> None:
         args.data_path,
         args.tokenizer_path,
     )
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len, max_tokens=args.val_max_tokens)
 
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size
@@ -889,6 +1083,12 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        mlp_kind=args.mlp_kind,
+        moe_num_experts=args.moe_num_experts,
+        moe_top_k=args.moe_top_k,
+        moe_expert_mlp_mult=args.moe_expert_mlp_mult,
+        moe_aux_loss_weight=args.moe_aux_loss_weight,
+        moe_capacity_factor=args.moe_capacity_factor,
         logit_chunk_tokens=args.logit_chunk_tokens,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
@@ -904,9 +1104,9 @@ def main() -> None:
     # inside RoPE modules), so compiling only against trainable parameters throws "uncaptured inputs".
     # Compiling the model-bound functions and capturing the full model state fixes that while still
     # returning gradients only for trainable parameters via nn.value_and_grad(...).
-    compiled_loss = mx.compile(lambda x, y: model.loss(x, y), inputs=model.state, outputs=model.state)
+    compiled_loss = mx.compile(lambda x, y: model.loss(x, y, include_aux=False), inputs=model.state, outputs=model.state)
     compiled_loss_and_grad = mx.compile(
-        nn.value_and_grad(model, lambda x, y: model.loss(x, y)),
+        nn.value_and_grad(model, lambda x, y: model.loss(x, y, include_aux=True)),
         inputs=model.state,
         outputs=model.state,
     )
@@ -917,6 +1117,8 @@ def main() -> None:
     log(f"mlx_version:{mx.__version__}")
     log(f"train_loader:shards pattern={args.train_files}")
     log(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.size - 1}")
+    if args.val_max_tokens > 0:
+        log(f"val_loader:token_cap:{args.val_max_tokens}")
     if expected_train_files is None:
         log(f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}")
     elif actual_train_files < expected_train_files:
@@ -933,6 +1135,14 @@ def main() -> None:
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
+    if args.mlp_kind == "dense":
+        log(f"mlp:kind=dense mlp_mult:{args.mlp_mult}")
+    else:
+        log(
+            f"mlp:kind=moe base_mlp_mult:{args.mlp_mult} experts:{args.moe_num_experts} top_k:{args.moe_top_k} "
+            f"expert_mlp_mult:{args.moe_expert_mlp_mult} aux_loss_weight:{args.moe_aux_loss_weight} "
+            f"capacity_factor:{args.moe_capacity_factor}"
+        )
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
         f"microbatch_tokens:{args.microbatch_tokens} microbatch_batch_size:{args.microbatch_tokens // args.train_seq_len} "
