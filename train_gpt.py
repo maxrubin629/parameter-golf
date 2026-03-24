@@ -30,11 +30,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
+# Default recurrent AttnRes run:
+# - 3 recurrent steps using one shared transformer block
+# - width 1280, 20 attention heads with 10 KV heads (GQA)
+# - MoE MLP with 16 experts, top-2 routing, and 0.125x expert expansion
+# - vocab size 1024, sequence length 256, tied embeddings
+# - 8,192 train tokens per step for 100,000 iterations with a ~5 minute cap
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
@@ -46,37 +47,44 @@ class Hyperparameters:
     seed = int(os.environ.get("SEED", 1337))
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
-    val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
-    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+    val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 16_384))
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 0))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
-    iterations = int(os.environ.get("ITERATIONS", 20000))
+    iterations = int(os.environ.get("ITERATIONS", 100_000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
-    warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
-    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    warmup_steps = int(os.environ.get("WARMUP_STEPS", 0))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 8_192))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 256))
+    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 300.0))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
+    num_layers = int(os.environ.get("NUM_LAYERS", 3))
+    model_dim = int(os.environ.get("MODEL_DIM", 1280))
+    num_heads = int(os.environ.get("NUM_HEADS", 20))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 10))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_kind = os.environ.get("MLP_KIND", "moe").strip().lower()
+    moe_num_experts = int(os.environ.get("MOE_NUM_EXPERTS", 16))
+    moe_top_k = int(os.environ.get("MOE_TOP_K", 2))
+    moe_expert_mlp_mult = float(os.environ.get("MOE_EXPERT_MLP_MULT", 0.125))
+    moe_aux_loss_weight = float(os.environ.get("MOE_AUX_LOSS_WEIGHT", 1e-2))
+    moe_capacity_factor = float(os.environ.get("MOE_CAPACITY_FACTOR", 1.25))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    logit_chunk_tokens = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.0075))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.006))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.006))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -289,7 +297,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,pseudo_queries",
     ).split(",")
     if pattern
 )
@@ -498,7 +506,7 @@ class DistributedTokenLoader:
 # -----------------------------
 
 class RMSNorm(nn.Module):
-    def __init__(self, eps: float | None = None):
+    def __init__(self, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
 
@@ -518,6 +526,19 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     with torch.no_grad():
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
+                param.data = param.data.float()
+
+
+def restore_block_matrix_params_to_fp32(module: nn.Module) -> None:
+    # Keep shared-block matrix params in fp32 even when they are stored as raw Parameters.
+    with torch.no_grad():
+        for name, param in module.named_parameters():
+            if (
+                name.startswith("block.")
+                and param.ndim == 2
+                and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+                and param.dtype != torch.float32
+            ):
                 param.data = param.data.float()
 
 
@@ -550,6 +571,13 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+
+
+def swiglu(x: Tensor, alpha: float = 1.702, limit: float = 7.0) -> Tensor:
+    x_glu = x[..., ::2].clamp(max=limit)
+    x_linear = x[..., 1::2].clamp(min=-limit, max=limit)
+    out_glu = x_glu * torch.sigmoid(alpha * x_glu)
+    return out_glu * (x_linear + 1)
 
 
 class CausalSelfAttention(nn.Module):
@@ -585,8 +613,8 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
+        q = F.rms_norm(q, (q.size(-1),), eps=1e-6)
+        k = F.rms_norm(k, (k.size(-1),), eps=1e-6)
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
@@ -604,17 +632,140 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
+    # gpt-oss-style SwiGLU with interleaved gate/up channels and explicit clamping.
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
-        hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
+        hidden = dim * mlp_mult
+        self.fc = CastedLinear(dim, hidden * 2, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._zero_init = True
+        self.zero_init_proj()
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        return self.proj(swiglu(self.fc(x)))
+
+    def forward_with_aux(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        return self(x), torch.zeros((), device=x.device, dtype=torch.float32)
+
+    def zero_init_proj(self) -> None:
+        self.proj._zero_init = True
+
+
+class MoEMLP(nn.Module):
+    # Sparse router over SwiGLU experts. `top_k=1` uses a true sparse dispatch
+    # path with fixed expert capacity; `top_k>1` falls back to the simpler
+    # materialized-all-experts path.
+    def __init__(
+        self,
+        dim: int,
+        expert_mlp_mult: float,
+        num_experts: int,
+        top_k: int,
+        aux_loss_weight: float,
+        capacity_factor: float,
+    ):
+        super().__init__()
+        if num_experts < 2:
+            raise ValueError("MOE_NUM_EXPERTS must be >= 2 when MLP_KIND=moe")
+        hidden = max(1, int(round(dim * expert_mlp_mult)))
+        self.dim = dim
+        self.hidden = hidden
+        self.num_experts = num_experts
+        self.top_k = max(1, min(top_k, num_experts))
+        self.aux_loss_weight = aux_loss_weight
+        self.capacity_factor = max(capacity_factor, 1.0)
+
+        self.router = CastedLinear(dim, num_experts, bias=False)
+        self.fc_weight = nn.Parameter(
+            torch.randn(num_experts * hidden * 2, dim, dtype=torch.float32) * (dim ** -0.5)
+        )
+        self.proj_weight = nn.Parameter(torch.zeros(num_experts * dim, hidden, dtype=torch.float32))
+
+    def _fc_weight(self, dtype: torch.dtype) -> Tensor:
+        return self.fc_weight.view(self.num_experts, self.hidden * 2, self.dim).to(dtype=dtype)
+
+    def _proj_weight(self, dtype: torch.dtype) -> Tensor:
+        return self.proj_weight.view(self.num_experts, self.dim, self.hidden).to(dtype=dtype)
+
+    def _forward_top1_sparse(self, x: Tensor, router_logits: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        bsz, seqlen, _ = x.shape
+        n_tokens = bsz * seqlen
+        x_flat = x.reshape(n_tokens, self.dim)
+        router_probs = F.softmax(router_logits, dim=-1).reshape(n_tokens, self.num_experts)
+
+        top1_idx = router_logits.reshape(n_tokens, self.num_experts).argmax(dim=-1)
+        top1_idx_col = top1_idx.unsqueeze(-1)
+        top1_prob = router_probs.gather(-1, top1_idx_col).reshape(n_tokens).to(dtype=x.dtype)
+        hard_assign = torch.zeros_like(router_probs).scatter(
+            -1,
+            top1_idx_col,
+            torch.ones((n_tokens, 1), device=x.device, dtype=router_probs.dtype),
+        )
+
+        counts = hard_assign.sum(dim=0).to(dtype=torch.int64)
+        sorted_token_idx = torch.argsort(top1_idx, dim=0)
+        sorted_experts = top1_idx.index_select(0, sorted_token_idx)
+        sorted_x = x_flat.index_select(0, sorted_token_idx)
+        sorted_prob = top1_prob.index_select(0, sorted_token_idx)
+
+        expert_offsets = counts.cumsum(dim=0) - counts
+        sorted_offsets = expert_offsets.index_select(0, sorted_experts)
+        positions = torch.arange(n_tokens, device=x.device, dtype=torch.int64) - sorted_offsets
+        capacity = max(1, math.ceil(self.capacity_factor * n_tokens / self.num_experts))
+        keep = positions < capacity
+        safe_pos = torch.where(keep, positions + 1, torch.zeros_like(positions))
+        flat_slot = sorted_experts * (capacity + 1) + safe_pos
+
+        packed_inputs = torch.zeros(
+            (self.num_experts * (capacity + 1), self.dim),
+            device=x.device,
+            dtype=x.dtype,
+        )
+        packed_inputs.scatter_(
+            0,
+            flat_slot[:, None].expand(-1, self.dim),
+            sorted_x * keep.to(dtype=sorted_x.dtype)[:, None],
+        )
+        packed_inputs = packed_inputs.view(self.num_experts, capacity + 1, self.dim)
+
+        projected = torch.einsum("ecd,ehd->ech", packed_inputs, self._fc_weight(x.dtype))
+        packed_outputs = torch.einsum("ech,edh->ecd", swiglu(projected), self._proj_weight(x.dtype))
+        gathered = packed_outputs.view(self.num_experts * (capacity + 1), self.dim).index_select(0, flat_slot)
+        gathered = gathered * (sorted_prob * keep.to(dtype=sorted_prob.dtype))[:, None]
+
+        y_flat = torch.zeros((n_tokens, self.dim), device=x.device, dtype=gathered.dtype)
+        y_flat.scatter_(0, sorted_token_idx[:, None].expand(-1, self.dim), gathered)
+        return (
+            y_flat.reshape(bsz, seqlen, self.dim),
+            router_probs.reshape(bsz, seqlen, self.num_experts),
+            hard_assign.reshape(bsz, seqlen, self.num_experts),
+        )
+
+    def _forward_materialized(self, x: Tensor, router_logits: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        topk_idx = torch.argsort(router_logits, dim=-1)[..., -self.top_k :]
+        router_probs = F.softmax(router_logits, dim=-1)
+        topk_probs = router_probs.gather(-1, topk_idx)
+        dispatch = torch.zeros_like(router_logits).scatter(-1, topk_idx, topk_probs)
+        hard_assign = torch.zeros_like(router_logits).scatter(-1, topk_idx, torch.ones_like(topk_probs))
+
+        projected = torch.einsum("btd,ehd->bteh", x, self._fc_weight(x.dtype))
+        expert_out = torch.einsum("bteh,edh->bted", swiglu(projected), self._proj_weight(x.dtype))
+        y = (dispatch.to(dtype=expert_out.dtype).unsqueeze(-1) * expert_out).sum(dim=2)
+        return y, router_probs, hard_assign
+
+    def forward_with_aux(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        router_logits = self.router(x).float()
+        if self.top_k == 1:
+            y, router_probs, hard_assign = self._forward_top1_sparse(x, router_logits)
+        else:
+            y, router_probs, hard_assign = self._forward_materialized(x, router_logits)
+
+        if self.aux_loss_weight <= 0.0:
+            return y, torch.zeros((), device=x.device, dtype=torch.float32)
+
+        expert_prob = router_probs.mean(dim=(0, 1))
+        expert_load = hard_assign.mean(dim=(0, 1)) / float(self.top_k)
+        aux_loss = self.aux_loss_weight * (self.num_experts * (expert_prob * expert_load).sum())
+        return y, aux_loss.float()
 
 
 class Block(nn.Module):
@@ -624,6 +775,12 @@ class Block(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
+        mlp_kind: str,
+        moe_num_experts: int,
+        moe_top_k: int,
+        moe_expert_mlp_mult: float,
+        moe_aux_loss_weight: float,
+        moe_capacity_factor: float,
         rope_base: float,
         qk_gain_init: float,
     ):
@@ -631,18 +788,29 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp_kind = mlp_kind
+        if mlp_kind == "dense":
+            self.mlp = MLP(dim, mlp_mult)
+        elif mlp_kind == "moe":
+            self.mlp = MoEMLP(
+                dim=dim,
+                expert_mlp_mult=moe_expert_mlp_mult,
+                num_experts=moe_num_experts,
+                top_k=moe_top_k,
+                aux_loss_weight=moe_aux_loss_weight,
+                capacity_factor=moe_capacity_factor,
+            )
+        else:
+            raise ValueError(f"Unsupported MLP_KIND={mlp_kind!r}; expected 'dense' or 'moe'")
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        return x
+        mlp_out, aux_loss = self.mlp.forward_with_aux(self.mlp_norm(x))
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        return x, aux_loss
 
 
 class GPT(nn.Module):
@@ -654,36 +822,44 @@ class GPT(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
+        mlp_kind: str,
+        moe_num_experts: int,
+        moe_top_k: int,
+        moe_expert_mlp_mult: float,
+        moe_aux_loss_weight: float,
+        moe_capacity_factor: float,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
+        logit_chunk_tokens: int,
         rope_base: float,
         qk_gain_init: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        self.num_layers = num_layers
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.logit_chunk_tokens = logit_chunk_tokens
+        self.mlp_kind = mlp_kind
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                )
-                for i in range(num_layers)
-            ]
+        self.block = Block(
+            model_dim,
+            num_heads,
+            num_kv_heads,
+            mlp_mult,
+            mlp_kind,
+            moe_num_experts,
+            moe_top_k,
+            moe_expert_mlp_mult,
+            moe_aux_loss_weight,
+            moe_capacity_factor,
+            rope_base,
+            qk_gain_init,
         )
+        self.pseudo_queries = nn.Parameter(torch.zeros(num_layers, model_dim, dtype=torch.float32))
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -691,37 +867,63 @@ class GPT(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        if self.tie_embeddings:
-            nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
-        skips: list[Tensor] = []
+    def softcap(self, logits: Tensor) -> Tensor:
+        return self.logit_softcap * torch.tanh(logits / self.logit_softcap)
 
-        # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+    def depth_attention(self, depth_cache: list[Tensor], step: int) -> Tensor:
+        values = torch.stack(depth_cache, dim=0)
+        keys = F.rms_norm(values, (values.size(-1),), eps=1e-6)
+        query = self.pseudo_queries[step].float()
+        logits = (keys.float() * query[None, None, None, :]).sum(dim=-1)
+        logits = logits - logits.amax(dim=0, keepdim=True)
+        alphas = logits.exp()
+        alphas = alphas / alphas.sum(dim=0, keepdim=True)
+        return (alphas.to(dtype=values.dtype).unsqueeze(-1) * values).sum(dim=0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
+    def hidden_and_aux(self, input_ids: Tensor) -> tuple[Tensor, Tensor]:
+        x = F.rms_norm(self.tok_emb(input_ids), (self.tok_emb.embedding_dim,), eps=1e-6)
+        depth_cache: list[Tensor] = [x]
+        aux_loss = torch.zeros((), device=x.device, dtype=torch.float32)
+
+        for step in range(self.num_layers):
+            x = self.depth_attention(depth_cache, step)
+            x, step_aux = self.block(x)
+            aux_loss = aux_loss + step_aux
+            depth_cache.append(x)
+        return self.final_norm(depth_cache[-1]), aux_loss
+
+    def project_logits(self, hidden: Tensor) -> Tensor:
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            logits_proj = F.linear(hidden, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+            logits_proj = self.lm_head(hidden)
+        return self.softcap(logits_proj)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor, include_aux: bool = False) -> Tensor:
+        hidden, aux_loss = self.hidden_and_aux(input_ids)
+        x = hidden.reshape(-1, hidden.size(-1))
+        targets = target_ids.reshape(-1)
+        if self.logit_chunk_tokens <= 0 or x.size(0) <= self.logit_chunk_tokens:
+            ce = F.cross_entropy(self.project_logits(x).float(), targets, reduction="mean")
+            return ce + aux_loss if include_aux else ce
+
+        loss_sum = torch.zeros((), device=x.device, dtype=torch.float32)
+        for start in range(0, x.size(0), self.logit_chunk_tokens):
+            end = min(start + self.logit_chunk_tokens, x.size(0))
+            loss_sum = loss_sum + F.cross_entropy(
+                self.project_logits(x[start:end]).float(),
+                targets[start:end],
+                reduction="sum",
+            )
+        ce = loss_sum / x.size(0)
+        return ce + aux_loss if include_aux else ce
 
 
 # -----------------------------
@@ -830,9 +1032,16 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        mlp_kind=args.mlp_kind,
+        moe_num_experts=args.moe_num_experts,
+        moe_top_k=args.moe_top_k,
+        moe_expert_mlp_mult=args.moe_expert_mlp_mult,
+        moe_aux_loss_weight=args.moe_aux_loss_weight,
+        moe_capacity_factor=args.moe_capacity_factor,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
+        logit_chunk_tokens=args.logit_chunk_tokens,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
@@ -840,15 +1049,16 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    restore_block_matrix_params_to_fp32(base_model)
+    compiled_model = torch.compile(base_model, dynamic=False)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
-    # - matrix params in transformer blocks use MATRIX_LR via Muon
-    # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    # - matrix params in the shared transformer block use MATRIX_LR via Muon
+    # - vectors/scalars plus pseudo-queries use SCALAR_LR via Adam
+    block_named_params = list(base_model.block.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
@@ -859,8 +1069,7 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+    scalar_params.append(base_model.pseudo_queries)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -896,7 +1105,18 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0("compile:torch_compile dynamic=False fullgraph=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"architecture:recurrent_attnres num_layers:{args.num_layers} mlp_kind:{args.mlp_kind} "
+        f"logit_chunk_tokens:{args.logit_chunk_tokens}"
+    )
+    if args.mlp_kind == "moe":
+        log0(
+            f"moe:num_experts:{args.moe_num_experts} top_k:{args.moe_top_k} "
+            f"expert_mlp_mult:{args.moe_expert_mlp_mult} aux_loss_weight:{args.moe_aux_loss_weight} "
+            f"capacity_factor:{args.moe_capacity_factor}"
+        )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -945,7 +1165,7 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                    warmup_loss = model(x, y, True)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1013,7 +1233,7 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                loss = model(x, y, True)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
