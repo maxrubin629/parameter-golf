@@ -1,0 +1,18 @@
+[project]
+name = "parameter-golf"
+version = "0.1.0"
+description = "A fork of OpenAI's parameter golf repo for testing on Mac and RunPod"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "datasets>=4.8.4",
+    "huggingface-hub>=1.7.2",
+    "kernels>=0.12.3",
+    "numpy>=2.4.3",
+    "sentencepiece>=0.2.1",
+    "setuptools>=82.0.1",
+    "tiktoken>=0.12.0",
+    "torch>=2.10.0",
+    "tqdm>=4.67.3",
+    "typing-extensions==4.15.0",
+]
