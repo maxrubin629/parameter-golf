@@ -1,0 +1,23 @@
+{
+  "bundle": "parameter_golf_looped_full_attnres_ablations_bundle",
+  "created_for": "Looped decoder ablations using Full Attention Residuals instead of Block Attention Residuals",
+  "primary_test_plan": "FULL_ATTNRES_LOOPED_DECODER_TEST_PLAN.md",
+  "primary_target": "train_gpt_mlx_loop_xsa_fullattnres_loopq.py",
+  "notes": [
+    "Full AttnRes scripts keep a global prior sublayer-output history.",
+    "Core loop blocks share transformer weights but use per-loop pseudo-query slots.",
+    "ATTNRES_MAX_SOURCES is a preallocated source budget and errors if exceeded; it is not a block truncation window."
+  ],
+  "files": [
+    "FULL_ATTNRES_LOOPED_DECODER_TEST_PLAN.md",
+    "train_gpt_mlx_current_record.py",
+    "train_gpt_mlx_loop_base.py",
+    "train_gpt_mlx_loop_fullattnres_loopq.py",
+    "train_gpt_mlx_loop_stable.py",
+    "train_gpt_mlx_loop_xsa.py",
+    "train_gpt_mlx_loop_xsa_fullattnres_loopq.py",
+    "train_gpt_mlx_loop_xsa_fullattnres_loopq_gate.py",
+    "train_gpt_mlx_loop_xsa_fullattnres_loopq_prevsummary.py",
+    "train_gpt_mlx_pg_baseline.py"
+  ]
+}

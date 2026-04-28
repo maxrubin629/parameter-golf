@@ -8,6 +8,7 @@ dependencies = [
     "datasets>=4.8.4",
     "huggingface-hub>=1.10.2",
     "kernels>=0.13.0",
+    "matplotlib>=3.10.9",
     "mlx>=0.31.1",
     "numpy>=2.4.4",
     "sentencepiece>=0.2.1",

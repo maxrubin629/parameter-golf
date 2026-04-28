@@ -1,0 +1,15 @@
+{
+  "files": [
+    "LOOPED_DECODER_ABLATION_TEST_PLAN.md",
+    "train_gpt_mlx_pg_baseline.py",
+    "train_gpt_mlx_loop_base.py",
+    "train_gpt_mlx_loop_stable.py",
+    "train_gpt_mlx_loop_xsa.py",
+    "train_gpt_mlx_loop_attnres_loopq.py",
+    "train_gpt_mlx_loop_xsa_attnres_loopq.py",
+    "train_gpt_mlx_loop_xsa_attnres_loopq_gate.py",
+    "train_gpt_mlx_loop_xsa_attnres_loopq_prevblocks.py",
+    "train_gpt_mlx_current_record.py"
+  ],
+  "notes": "Generated from my-parameter-golf-main/train_gpt_mlx.py. v3 removes ATTNRES_ALL_BLOCKS and shared/core-only AttnRes variants: Attention Residuals are either absent everywhere or active across prelude, recurrent core, and coda. Recurrent core AttnRes mixers use separate loop-iteration slots. Includes train_gpt_mlx_current_record.py as an MLX architecture port of the 2026-04-09 SP8192 current-record README; it is a separate SP8192 reference, not part of the SP1024 looped-decoder ladder. Copy files into repo root and run commands from the test plan."
+}

@@ -1,0 +1,29 @@
+{
+  "bundle": "parameter_golf_looped_full_attnres_identity_mlx_bundle",
+  "created_for": "Looped decoder ablations using identity-preserving MLX Full Attention Residuals",
+  "primary_test_plan": "FULL_ATTNRES_IDENTITY_TEST_PLAN.md",
+  "primary_target": "train_gpt_mlx_loop_xsa_fullattnres_loopq.py",
+  "notes": [
+    "Full AttnRes scripts keep the optimized AttnResHistory cache.",
+    "Full AttnRes sources are post-residual hidden states, not raw attention/MLP deltas.",
+    "The normal additive residual stream is preserved; AttnRes chooses sublayer inputs.",
+    "DepthMixer uses a dynamic recency prior so initialization is near latest-source identity.",
+    "XSA-enabled scripts default to fixed paper-faithful projection removal.",
+    "Full AttnRes scripts support MAX_VAL_TOKENS and SKIP_QUANTIZED_VALIDATION for fast smoke triage."
+  ],
+  "files": [
+    "FULL_ATTNRES_IDENTITY_TEST_PLAN.md",
+    "FULL_ATTNRES_LOOPED_DECODER_TEST_PLAN.md",
+    "IDENTITY_IMPLEMENTATION_NOTES.md",
+    "OPTIMIZATION_NOTES.md",
+    "train_gpt_mlx_current_record.py",
+    "train_gpt_mlx_loop_base.py",
+    "train_gpt_mlx_loop_fullattnres_loopq.py",
+    "train_gpt_mlx_loop_stable.py",
+    "train_gpt_mlx_loop_xsa.py",
+    "train_gpt_mlx_loop_xsa_fullattnres_loopq.py",
+    "train_gpt_mlx_loop_xsa_fullattnres_loopq_gate.py",
+    "train_gpt_mlx_loop_xsa_fullattnres_loopq_prevsummary.py",
+    "train_gpt_mlx_pg_baseline.py"
+  ]
+}
