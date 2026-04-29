@@ -369,6 +369,10 @@ HTML_PAGE = r"""<!doctype html>
             <option value="name">Name</option>
           </select>
         </label>
+        <label class="control-wrap">
+          <span class="control-label">X max</span>
+          <input id="xMax" type="number" min="1" step="1" placeholder="Auto">
+        </label>
         <button id="refresh" class="refresh">↻ <span>Refresh Now</span></button>
         <span class="divider"></span>
         <span class="switch-row"><span class="spinner"></span> Auto-refresh <button id="pause" class="switch" aria-label="Pause auto refresh"><span class="knob"></span></button><span id="pauseLabel">Paused</span></span>
@@ -408,7 +412,7 @@ HTML_PAGE = r"""<!doctype html>
   <script>
     const state = { data: null, selected: null, paused: false };
     const els = {
-      filter: document.getElementById("filter"), sort: document.getElementById("sort"), refresh: document.getElementById("refresh"), pause: document.getElementById("pause"), pauseLabel: document.getElementById("pauseLabel"), updated: document.getElementById("updated"), runsBody: document.getElementById("runsBody"), runCount: document.getElementById("runCount"), totalRuns: document.getElementById("totalRuns"), activeCount: document.getElementById("activeCount"), bestBpb: document.getElementById("bestBpb"), bestFile: document.getElementById("bestFile"), winnerNote: document.getElementById("winnerNote"), statusCounts: document.getElementById("statusCounts"), details: document.getElementById("details"), lossChart: document.getElementById("lossChart"), bpbChart: document.getElementById("bpbChart"), tail: document.getElementById("tail"), artifacts: document.getElementById("artifacts")
+      filter: document.getElementById("filter"), sort: document.getElementById("sort"), xMax: document.getElementById("xMax"), refresh: document.getElementById("refresh"), pause: document.getElementById("pause"), pauseLabel: document.getElementById("pauseLabel"), updated: document.getElementById("updated"), runsBody: document.getElementById("runsBody"), runCount: document.getElementById("runCount"), totalRuns: document.getElementById("totalRuns"), activeCount: document.getElementById("activeCount"), bestBpb: document.getElementById("bestBpb"), bestFile: document.getElementById("bestFile"), winnerNote: document.getElementById("winnerNote"), statusCounts: document.getElementById("statusCounts"), details: document.getElementById("details"), lossChart: document.getElementById("lossChart"), bpbChart: document.getElementById("bpbChart"), tail: document.getElementById("tail"), artifacts: document.getElementById("artifacts")
     };
 
     const statuses = ["training", "validating", "trained", "complete", "waiting", "stopped"];
@@ -465,7 +469,7 @@ HTML_PAGE = r"""<!doctype html>
       if (usable.length < 2) return `<div class="empty">Not enough ${esc(field)} points yet.</div>`;
       const width = 760, height = 248, padL = 48, padR = 14, padT = 12, padB = 34;
       const xs = usable.map(p => p.step), ys = usable.map(p => p[field]);
-      const minX = Math.min(...xs), maxX = xLabelMax || Math.max(...xs);
+      const minX = 0, maxX = xLabelMax || Math.max(...xs);
       let minY = Math.min(...ys), maxY = Math.max(...ys);
       const yPad = (maxY - minY || 1) * .08; minY -= yPad; maxY += yPad;
       const x = v => padL + ((v - minX) / Math.max(1, maxX - minX)) * (width - padL - padR);
@@ -494,8 +498,10 @@ HTML_PAGE = r"""<!doctype html>
         <div class="rule"></div>
         <div class="detail-row"><span>Saved Model Artifacts</span><span>${modelLines.length}</span></div><div class="detail-row"><span>Compressed Artifacts</span><span>${compressedLines.length}</span></div>
         <div class="rule"></div><a class="open-log" href="/api/raw?name=${encodeURIComponent(run.name)}" target="_blank">↗ Open Log File</a>`;
-      els.lossChart.innerHTML = chart(run.train_points || [], "train_loss", "loss-line", "chart-dot-loss", run.total_steps);
-      els.bpbChart.innerHTML = chart(run.val_events || [], "val_bpb", "bpb-line", "chart-dot-bpb");
+      const manualXMax = parseInt(els.xMax.value, 10);
+      const xMax = Number.isFinite(manualXMax) && manualXMax > 0 ? manualXMax : run.total_steps;
+      els.lossChart.innerHTML = chart(run.train_points || [], "train_loss", "loss-line", "chart-dot-loss", xMax);
+      els.bpbChart.innerHTML = chart(run.val_events || [], "val_bpb", "bpb-line", "chart-dot-bpb", xMax);
       els.tail.textContent = (run.tail || []).join("\n");
       els.artifacts.innerHTML = `${artifactSection("Saved Model Artifact Lines", modelLines)}${artifactSection("Compressed Serialized Artifact Lines", compressedLines, "compressed")}<div class="artifact-block"><h3 class="panel-title">Final Validation Metrics <span class="section-sub">(from final_* lines)</span></h3><div class="artifact-lines final">${finalLines.length ? finalLines.map(line => `<div>${esc(line)}</div>`).join("") : `<div>-</div>`}</div></div>`;
     }
@@ -515,6 +521,7 @@ HTML_PAGE = r"""<!doctype html>
 
     els.filter.addEventListener("input", render);
     els.sort.addEventListener("change", render);
+    els.xMax.addEventListener("input", render);
     els.refresh.addEventListener("click", load);
     els.pause.addEventListener("click", () => { state.paused = !state.paused; els.pauseLabel.textContent = state.paused ? "Paused" : "Running"; if (!state.paused) load(); });
     load();
