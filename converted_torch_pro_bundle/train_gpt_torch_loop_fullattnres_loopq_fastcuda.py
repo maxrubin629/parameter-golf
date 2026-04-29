@@ -31,7 +31,7 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 COMPUTE_DTYPE = torch.bfloat16
 ARCH_KIND = "looped"
-ARCH_NAME_DEFAULT = "loop_fullattnres_loopq"
+ARCH_NAME_DEFAULT = "loop_fullattnres_loopq_xsa"
 DEFAULT_DATA_PATH = "./data/datasets/fineweb10B_sp1024"
 DEFAULT_TOKENIZER_PATH = "./data/tokenizers/fineweb_1024_bpe.model"
 DEFAULT_RUN_ID_PREFIX = ""
@@ -57,9 +57,9 @@ DEFAULT_GRAD_CLIP_NORM = 0.0
 DEFAULT_MEMORY_SLOTS = 0
 ARCH_LOOPED = True
 ARCH_STABLE_RECURRENCE = True
-ARCH_XSA_ENABLED = False
+ARCH_XSA_ENABLED = True
 ARCH_XSA_LEARNED = False
-ARCH_XSA_LAMBDA_INIT = 0.0
+ARCH_XSA_LAMBDA_INIT = 1.0
 ARCH_ATTNRES_ENABLED = True
 ARCH_ATTNRES_MODE = "full"
 ARCH_ATTNRES_USE_GATE = False
