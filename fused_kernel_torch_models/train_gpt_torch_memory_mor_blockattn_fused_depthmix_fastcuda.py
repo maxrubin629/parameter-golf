@@ -1418,12 +1418,16 @@ class MemoryMoRGPT(nn.Module):
     def _depth_mix(self, x: Tensor, sources: list[Tensor], idx: int) -> Tensor:
         if not self.use_depth_mix or not sources:
             return x
+        vals = None
+        keys = None
         if self.fused_depthmix:
-            values = sources + [x]
-            keys = [rms_norm(value) for value in values]
+            vals = torch.stack(sources + [x], dim=0)
+            keys = rms_norm(vals)
+            values = list(vals.unbind(dim=0))
+            key_values = list(keys.unbind(dim=0))
             mixed = fused_full_depth_mixer(
                 values,
-                keys,
+                key_values,
                 self.depth_queries[idx],
                 self._fused_depthmix_zero_bias[: len(values)],
                 self.inv_sqrt_dim,
@@ -1433,8 +1437,9 @@ class MemoryMoRGPT(nn.Module):
             if mixed is not None:
                 gate = torch.tanh(self.depth_gates[idx]).to(dtype=x.dtype).reshape(1, 1, self.dim)
                 return x + 0.5 * gate * (mixed - x)
-        vals = torch.stack(sources + [x], dim=0)
-        keys = rms_norm(vals)
+        if vals is None or keys is None:
+            vals = torch.stack(sources + [x], dim=0)
+            keys = rms_norm(vals)
         q = self.depth_queries[idx].to(dtype=x.dtype).reshape(1, 1, 1, self.dim)
         logits = torch.sum(keys * q, dim=-1) * self.inv_sqrt_dim
         weights = torch.softmax(logits.float(), dim=0).to(dtype=x.dtype)

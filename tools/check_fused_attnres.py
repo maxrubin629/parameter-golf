@@ -8,7 +8,11 @@ from pathlib import Path
 import torch
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "converted_torch_pro_bundle" / "train_gpt_torch_loop_fullattnres_loopq_fastcuda.py"
+SCRIPT = (
+    Path(__file__).resolve().parents[1]
+    / "converted_torch_pro_bundle"
+    / "train_gpt_torch_loop_fullattnres_loopq_fused_attnres_fastcuda.py"
+)
 
 
 def load_training_module():
