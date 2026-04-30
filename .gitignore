@@ -1,8 +1,6 @@
 data/tokenizers
 __pycache__/
 .DS_Store
-modded-nanogpt/
-modded-nanogpt
 data/datasets
 data/manifest.json
 data/docs_selected.jsonl
@@ -11,3 +9,4 @@ data/docs_selected.jsonl
 /logs/
 past-runs/
 agent-context/
+remote_runs/
